@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+celerybeat-schedule
+celerybeat.pid
+*.sage.py
+.env
+.venv
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.vercel
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.eslintcache
+*.tsbuildinfo
+next-env.d.ts
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Docker
+docker-compose.override.yml
+
+# Environment / Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Logs
+*.log
+logs/
+/tmp/
+
+# Database
+*.db
+*.sqlite3
+pgdata/
+
+# MediaPipe / ML models
+*.tflite
+*.pb
+mediapipe_models/
+
+# Output artifacts
+*.csv
+*.xlsx
+uploads/
+.editor_tools_backups
