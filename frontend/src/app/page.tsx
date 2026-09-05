@@ -1,59 +1,58 @@
-"use client";
 import Link from "next/link";
-import { useAuth } from "@/lib/auth";
+import { GraduationCap, Brain, QrCode, Calendar, ArrowRight } from "lucide-react";
 
-export default function Home() {
-  const { user, loading } = useAuth();
+const features = [
+  { icon: Brain, title: "AI Assistant", desc: "Ask about your classes, CGPA, or routine in Bangla or English." },
+  { icon: QrCode, title: "Smart Attendance", desc: "QR-based attendance with bunk calculator and real-time stats." },
+  { icon: Calendar, title: "Routine & Courses", desc: "Visual timetable, course enrollment, and syllabus tracking." },
+];
 
-  if (loading) return <div className="text-center py-20 text-gray-400">Loading...</div>;
-
-  if (user) {
-    const dashPath = user.role === "teacher" ? "/teacher" : "/dashboard";
-    return (
-      <div className="text-center py-20">
-        <h1 className="text-4xl font-bold mb-4">Welcome back, {user.name}! 👋</h1>
-        <p className="text-gray-600 mb-8">Role: {user.role.charAt(0).toUpperCase() + user.role.slice(1)}</p>
-        <Link href={dashPath} className="bg-indigo-600 text-white px-6 py-3 rounded-lg text-lg hover:bg-indigo-700 transition">
-          Go to Dashboard →
-        </Link>
-      </div>
-    );
-  }
-
+export default function LandingPage() {
   return (
-    <div className="text-center py-20">
-      <h1 className="text-5xl font-bold mb-6 bg-gradient-to-r from-indigo-600 to-purple-600 bg-clip-text text-transparent">
-        🎓 CampusMind
-      </h1>
-      <p className="text-xl text-gray-600 mb-10 max-w-2xl mx-auto">
-        Smart Campus Management with Face Attendance, AI Assistant in Bangla/English, and Academic Dashboard
-      </p>
-      <div className="flex gap-4 justify-center">
-        <Link href="/login" className="bg-indigo-600 text-white px-8 py-3 rounded-lg text-lg hover:bg-indigo-700 transition">
-          Login
-        </Link>
-        <Link href="/register" className="border-2 border-indigo-600 text-indigo-600 px-8 py-3 rounded-lg text-lg hover:bg-indigo-50 transition">
-          Register
-        </Link>
-      </div>
+    <div className="min-h-screen flex flex-col">
+      {/* Hero */}
+      <header className="relative flex-1 flex items-center justify-center overflow-hidden">
+        <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-accent/5" />
+        <div className="relative text-center px-4 max-w-2xl mx-auto animate-fade-in">
+          <div className="inline-flex items-center gap-2 mb-6">
+            <GraduationCap size={32} className="text-primary" />
+            <span className="text-lg font-bold">Campus Mind</span>
+          </div>
+          <h1 className="text-3xl md:text-5xl font-bold leading-tight mb-4">
+            Your campus life,
+            <br />
+            <span className="text-transparent bg-clip-text bg-gradient-to-r from-primary to-accent">organized.</span>
+          </h1>
+          <p className="text-text-muted text-sm md:text-base max-w-md mx-auto mb-8">
+            Attendance, routines, results, and an AI assistant that actually understands you.
+          </p>
+          <div className="flex items-center justify-center gap-3">
+            <Link href="/register" className="inline-flex items-center gap-2 px-6 py-3 bg-primary hover:bg-primary-hover text-white rounded-lg font-medium text-sm transition-all shadow-glow">
+              Get Started <ArrowRight size={16} />
+            </Link>
+            <Link href="/login" className="inline-flex items-center gap-2 px-6 py-3 bg-surface-2 border border-border rounded-lg text-sm font-medium hover:border-border-hover transition-all">
+              Sign In
+            </Link>
+          </div>
+        </div>
+      </header>
 
-      <div className="grid md:grid-cols-3 gap-6 mt-16 max-w-4xl mx-auto text-left">
-        <div className="bg-white p-6 rounded-xl shadow-sm border">
-          <div className="text-3xl mb-3">📸</div>
-          <h3 className="font-bold text-lg mb-2">Smart Attendance</h3>
-          <p className="text-gray-600 text-sm">Face recognition + QR code fallback. Auto-stats, bunk calculator, CSV export.</p>
+      {/* Features */}
+      <section className="py-16 px-4">
+        <div className="max-w-4xl mx-auto grid md:grid-cols-3 gap-6">
+          {features.map(({ icon: Icon, title, desc }) => (
+            <div key={title} className="bg-surface border border-glass-border rounded-lg p-6 hover:border-border-hover transition-all">
+              <Icon size={24} className="text-primary mb-3" />
+              <h3 className="text-sm font-semibold mb-1">{title}</h3>
+              <p className="text-xs text-text-muted leading-relaxed">{desc}</p>
+            </div>
+          ))}
         </div>
-        <div className="bg-white p-6 rounded-xl shadow-sm border">
-          <div className="text-3xl mb-3">🤖</div>
-          <h3 className="font-bold text-lg mb-2">AI Assistant</h3>
-          <p className="text-gray-600 text-sm">Ask in Bangla or English. &quot;আমার কাল কি ক্লাস?&quot; — get instant answers from your data.</p>
-        </div>
-        <div className="bg-white p-6 rounded-xl shadow-sm border">
-          <div className="text-3xl mb-3">📊</div>
-          <h3 className="font-bold text-lg mb-2">Academic Dashboard</h3>
-          <p className="text-gray-600 text-sm">Routine, results, CGPA calculator, syllabus tracker — all in one place.</p>
-        </div>
-      </div>
+      </section>
+
+      <footer className="py-6 text-center text-xs text-text-muted/50 border-t border-glass-border">
+        Campus Mind — built for students who'd rather code than attend.
+      </footer>
     </div>
   );
 }

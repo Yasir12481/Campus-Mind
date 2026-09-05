@@ -1,71 +1,66 @@
 "use client";
 import { createContext, useContext, useState, useEffect, ReactNode } from "react";
-import { authApi } from "@/lib/api";
+import { useRouter } from "next/navigation";
 
 interface User {
   id: number;
   name: string;
   email: string;
-  role: "student" | "teacher" | "admin";
-  student_id?: string;
-  department?: string;
+  role: string;
 }
 
-interface AuthContextType {
+interface AuthContextValue {
   user: User | null;
   token: string | null;
-  login: (email: string, password: string) => Promise<void>;
-  register: (data: any) => Promise<void>;
+  login: (token: string, user: User) => void;
   logout: () => void;
-  loading: boolean;
+  isAuthenticated: boolean;
 }
 
-const AuthContext = createContext<AuthContextType>({} as AuthContextType);
+const AuthContext = createContext<AuthContextValue>({
+  user: null,
+  token: null,
+  login: () => {},
+  logout: () => {},
+  isAuthenticated: false,
+});
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const router = useRouter();
 
   useEffect(() => {
-    const stored = localStorage.getItem("campusmind_token");
-    if (stored) {
-      setToken(stored);
-      authApi.me(stored)
-        .then((u) => setUser(u))
-        .catch(() => {
-          localStorage.removeItem("campusmind_token");
-          setToken(null);
-        })
-        .finally(() => setLoading(false));
-    } else {
-      setLoading(false);
+    const savedToken = localStorage.getItem("token");
+    const savedUser = localStorage.getItem("user");
+    if (savedToken && savedUser) {
+      setToken(savedToken);
+      setUser(JSON.parse(savedUser));
     }
   }, []);
 
-  const login = async (email: string, password: string) => {
-    const res = await authApi.login(email, password);
-    localStorage.setItem("campusmind_token", res.access_token);
-    setToken(res.access_token);
-    const u = await authApi.me(res.access_token);
+  const login = (t: string, u: User) => {
+    setToken(t);
     setUser(u);
-  };
-
-  const register = async (data: any) => {
-    await authApi.register(data);
+    localStorage.setItem("token", t);
+    localStorage.setItem("user", JSON.stringify(u));
   };
 
   const logout = () => {
-    localStorage.removeItem("campusmind_token");
     setToken(null);
     setUser(null);
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+    router.push("/login");
   };
 
   return (
-    <AuthContext.Provider value={{ user, token, login, register, logout, loading }}>
+    <AuthContext.Provider value={{ user, token, login, logout, isAuthenticated: !!token }}>
       {children}
     </AuthContext.Provider>
   );
 }
-
-export const useAuth = () => useContext(AuthContext);

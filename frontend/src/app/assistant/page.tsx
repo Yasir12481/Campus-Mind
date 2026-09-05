@@ -2,112 +2,93 @@
 import { useState, useRef, useEffect } from "react";
 import { useAuth } from "@/lib/auth";
 import { useRouter } from "next/navigation";
+import Navbar from "@/components/Navbar";
+import Button from "@/components/ui/Button";
+import { useToast } from "@/components/ui/Toast";
 import { assistantApi } from "@/lib/api";
+import { Send, Bot, User } from "lucide-react";
 
-interface Message {
-  role: "user" | "assistant";
-  text: string;
-}
-
-const SUGGESTIONS = [
-  "আমার কাল কি ক্লাস?",
-  "amar attendance koto?",
-  "CSE-301 er teacher ke?",
-  "amar cgpa koto?",
-  "next class kokhon?",
-  "amar result dekhao",
-];
+interface Message { role: "user" | "ai"; text: string }
 
 export default function AssistantPage() {
-  const { token, loading: authLoading } = useAuth();
+  const { token, isAuthenticated } = useAuth();
   const router = useRouter();
-  const [messages, setMessages] = useState<Message[]>([
-    { role: "assistant", text: "হ্যালো! 👋 আমি CampusMind AI Assistant. বাংলায় বা ইংরেজিতে প্রশ্ন করুন। যেমন: 'আমার কাল কি ক্লাস?' বা 'amar attendance koto?'" },
-  ]);
+  const { toast } = useToast();
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
+  const [loading, setLoading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!authLoading && !token) router.push("/login");
-  }, [token, authLoading, router]);
+    if (!isAuthenticated) router.push("/login");
+  }, [isAuthenticated, router]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const send = async (text?: string) => {
-    const msg = text || input.trim();
-    if (!msg || !token) return;
+  if (!isAuthenticated) return null;
+
+  const handleSend = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || !token) return;
+    const userMsg = input.trim();
     setInput("");
-    setMessages((prev) => [...prev, { role: "user", text: msg }]);
-    setSending(true);
+    setMessages((prev) => [...prev, { role: "user", text: userMsg }]);
+    setLoading(true);
     try {
-      const res = await assistantApi.chat(token, msg);
-      setMessages((prev) => [...prev, { role: "assistant", text: res.reply }]);
-    } catch (err: any) {
-      setMessages((prev) => [...prev, { role: "assistant", text: `Error: ${err.message}` }]);
+      const res = await assistantApi.chat(token, userMsg);
+      setMessages((prev) => [...prev, { role: "ai", text: res.reply }]);
+    } catch (err) {
+      toast("error", (err as Error).message);
     } finally {
-      setSending(false);
+      setLoading(false);
     }
   };
 
-  if (authLoading) return <div className="text-center py-20 text-gray-400">Loading...</div>;
-
   return (
-    <div className="max-w-3xl mx-auto">
-      <h1 className="text-2xl font-bold mb-6">🤖 AI Assistant</h1>
+    <div className="min-h-screen flex flex-col">
+      <Navbar />
+      <main className="flex-1 max-w-2xl mx-auto w-full px-4 py-6 flex flex-col">
+        <h1 className="text-lg font-bold mb-4">AI Assistant</h1>
 
-      {/* Chat Area */}
-      <div className="bg-white rounded-xl shadow-sm border min-h-[400px] flex flex-col">
-        <div className="flex-1 p-4 space-y-4 overflow-y-auto max-h-[500px]">
+        <div className="flex-1 overflow-y-auto space-y-4 mb-4">
+          {messages.length === 0 && (
+            <div className="text-center text-text-muted text-xs py-12">
+              Ask me about your attendance, CGPA, routine, or teachers.
+              <br />বাংলাতেও জিজ্ঞাসা করতে পারো 😊
+            </div>
+          )}
           {messages.map((m, i) => (
-            <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[80%] px-4 py-3 rounded-2xl text-sm leading-relaxed ${
-                m.role === "user"
-                  ? "bg-indigo-600 text-white rounded-br-md"
-                  : "bg-gray-100 text-gray-800 rounded-bl-md"
-              }`}>
+            <div key={i} className={`flex gap-3 ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+              {m.role === "ai" && <Bot size={18} className="text-primary mt-1 shrink-0" />}
+              <div className={`max-w-[80%] px-4 py-2.5 rounded-lg text-sm ${m.role === "user" ? "bg-primary/20 text-text" : "bg-surface-2 text-text border border-border"}`}>
                 {m.text}
               </div>
+              {m.role === "user" && <User size={18} className="text-text-muted mt-1 shrink-0" />}
             </div>
           ))}
-          {sending && (
-            <div className="flex justify-start">
-              <div className="bg-gray-100 px-4 py-3 rounded-2xl rounded-bl-md text-sm text-gray-400 animate-pulse">
-                Thinking...
-              </div>
+          {loading && (
+            <div className="flex gap-3">
+              <Bot size={18} className="text-primary mt-1" />
+              <div className="px-4 py-2.5 rounded-lg bg-surface-2 border border-border text-sm text-text-muted animate-pulse">Thinking...</div>
             </div>
           )}
           <div ref={bottomRef} />
         </div>
 
-        {/* Suggestions */}
-        <div className="px-4 py-2 flex gap-2 overflow-x-auto border-t">
-          {SUGGESTIONS.map((s) => (
-            <button key={s} onClick={() => send(s)} disabled={sending}
-              className="whitespace-nowrap text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-full hover:bg-indigo-100 transition disabled:opacity-50">
-              {s}
-            </button>
-          ))}
-        </div>
-
-        {/* Input */}
-        <div className="p-4 border-t flex gap-2">
+        <form onSubmit={handleSend} className="flex gap-2">
           <input
-            type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && send()}
-            placeholder="Ask in Bangla or English..."
-            className="flex-1 border rounded-lg px-4 py-2 focus:ring-2 focus:ring-indigo-500 outline-none text-sm"
+            placeholder="Ask anything about your campus life..."
+            className="flex-1 px-4 py-2.5 bg-surface-2 border border-border rounded-lg text-sm text-text placeholder:text-text-muted/50 focus:border-primary focus:ring-1 focus:ring-primary/30 transition-colors"
           />
-          <button onClick={() => send()} disabled={sending || !input.trim()}
-            className="bg-indigo-600 text-white px-6 py-2 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 text-sm font-medium">
-            Send
-          </button>
-        </div>
-      </div>
+          <Button type="submit" loading={loading} disabled={!input.trim()}>
+            <Send size={16} />
+          </Button>
+        </form>
+      </main>
     </div>
   );
 }
