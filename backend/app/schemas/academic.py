@@ -45,6 +45,12 @@ class RoutineCreate(BaseModel):
     end_time: time
     room: str
 
+class RoutineUpdate(BaseModel):
+    day_of_week: Optional[DayOfWeek] = None
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
+    room: Optional[str] = None
+
 class RoutineResponse(BaseModel):
     id: int
     course_id: int

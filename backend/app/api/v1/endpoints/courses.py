@@ -49,12 +49,28 @@ async def get_course(course_id: int, db: AsyncSession = Depends(get_db), current
     return course
 
 
+@router.get("/catalog", response_model=List[CourseResponse])
+async def course_catalog(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Course))
+    return result.scalars().all()
+
+
 @router.post("/enroll", response_model=EnrollmentResponse, status_code=status.HTTP_201_CREATED)
 async def enroll_student(
     data: EnrollmentCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.ADMIN, UserRole.TEACHER)),
+    current_user: User = Depends(get_current_user),
 ):
+    # Allow student self-enrollment
+    if current_user.role == UserRole.STUDENT:
+        if data.student_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Can only enroll yourself")
+    elif current_user.role not in (UserRole.ADMIN, UserRole.TEACHER):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
     existing = await db.execute(
         select(Enrollment).where(
             Enrollment.student_id == data.student_id,
@@ -79,3 +95,18 @@ async def my_enrolled_courses(
         select(Course).join(Enrollment).where(Enrollment.student_id == current_user.id)
     )
     return result.scalars().all()
+
+
+@router.delete("/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_course(
+    course_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.TEACHER, UserRole.ADMIN)),
+):
+    result = await db.execute(select(Course).where(Course.id == course_id))
+    course = result.scalar_one_or_none()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+    if current_user.role == UserRole.TEACHER and course.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your course")
+    await db.delete(course)
