@@ -1,0 +1,1298 @@
+#!/usr/bin/env python3
+"""CampusMind — Smart Campus Management System.
+Pure Python stdlib + SQLite. No frameworks.
+"""
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import sqlite3
+import time
+from datetime import date, datetime, timedelta, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
+
+# ─────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────
+PORT = 8000
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'campusmind.db')
+SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+SESSION_NAME = 'campusmind_session'
+SESSION_MAX_AGE = 86400 * 7  # 7 days
+
+# ─────────────────────────────────────────────
+# Database
+# ─────────────────────────────────────────────
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'student',
+        student_id TEXT,
+        department TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS courses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        credits INTEGER DEFAULT 3,
+        department TEXT,
+        teacher_id INTEGER REFERENCES users(id),
+        semester TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS enrollments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_id INTEGER NOT NULL REFERENCES users(id),
+        course_id INTEGER NOT NULL REFERENCES courses(id),
+        enrolled_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(student_id, course_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS routines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id INTEGER NOT NULL REFERENCES courses(id),
+        day_of_week TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        room TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS attendance_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id INTEGER NOT NULL REFERENCES courses(id),
+        teacher_id INTEGER NOT NULL REFERENCES users(id),
+        qr_code TEXT NOT NULL,
+        session_date TEXT DEFAULT (date('now')),
+        expires_at TEXT NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS attendance_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES attendance_sessions(id),
+        student_id INTEGER NOT NULL REFERENCES users(id),
+        method TEXT NOT NULL DEFAULT 'qr',
+        status TEXT NOT NULL DEFAULT 'present',
+        marked_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(session_id, student_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_id INTEGER NOT NULL REFERENCES users(id),
+        course_id INTEGER NOT NULL REFERENCES courses(id),
+        exam_type TEXT NOT NULL,
+        marks_obtained REAL NOT NULL,
+        total_marks REAL NOT NULL,
+        grade TEXT,
+        grade_point REAL,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS syllabus_topics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id INTEGER NOT NULL REFERENCES courses(id),
+        title TEXT NOT NULL,
+        week_number INTEGER,
+        is_completed INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        is_read INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+
+# ─────────────────────────────────────────────
+# Auth Helpers
+# ─────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    return f"{salt}${h.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    salt, h = stored.split('$', 1)
+    check = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    return hmac.compare_digest(check.hex(), h)
+
+
+def create_session_token(user_id: int) -> str:
+    payload = f"{user_id}:{int(time.time())}"
+    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{sig}"
+
+
+def verify_session_token(token: str) -> int | None:
+    try:
+        parts = token.split(':')
+        if len(parts) != 3:
+            return None
+        uid, ts, sig = parts
+        payload = f"{uid}:{ts}"
+        expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if int(time.time()) - int(ts) > SESSION_MAX_AGE:
+            return None
+        return int(uid)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_current_user(handler) -> dict | None:
+    cookies = parse_cookies(handler.headers.get('Cookie', ''))
+    token = cookies.get(SESSION_NAME)
+    if not token:
+        return None
+    uid = verify_session_token(token)
+    if uid is None:
+        return None
+    conn = get_db()
+    row = conn.execute("SELECT id, name, email, role, student_id, department FROM users WHERE id=?", (uid,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def parse_cookies(cookie_str: str) -> dict:
+    cookies = {}
+    for item in cookie_str.split(';'):
+        if '=' in item:
+            k, v = item.strip().split('=', 1)
+            cookies[k] = v
+    return cookies
+
+
+# ─────────────────────────────────────────────
+# Grade Calculator
+# ─────────────────────────────────────────────
+def calc_grade(marks: float, total: float) -> tuple[str, float]:
+    pct = (marks / total) * 100 if total > 0 else 0
+    if pct >= 80: return 'A+', 4.00
+    if pct >= 75: return 'A', 3.75
+    if pct >= 70: return 'A-', 3.50
+    if pct >= 65: return 'B+', 3.25
+    if pct >= 60: return 'B', 3.00
+    if pct >= 55: return 'B-', 2.75
+    if pct >= 50: return 'C+', 2.50
+    if pct >= 45: return 'C', 2.25
+    if pct >= 40: return 'D', 2.00
+    return 'F', 0.00
+
+
+# ─────────────────────────────────────────────
+# Assistant Logic
+# ─────────────────────────────────────────────
+DAY_MAP = {
+    'saturday': 'Saturday', 'sunday': 'Sunday', 'monday': 'Monday',
+    'tuesday': 'Tuesday', 'wednesday': 'Wednesday', 'thursday': 'Thursday',
+    'friday': 'Friday',
+}
+
+
+def detect_query_type(msg: str) -> str:
+    msg = msg.lower().strip()
+    if re.search(r'[a-z]{2,4}-\d{3}', msg):
+        if any(kw in msg for kw in ['teacher', 'কে', 'শিক্ষক', 'স্যার']):
+            return 'course_teacher'
+    if any(kw in msg for kw in ['attendance', 'উপস্থিতি', 'হাজিরা', 'এটেন্ডেন্স']):
+        return 'attendance_stats'
+    if any(kw in msg for kw in ['tomorrow', 'কাল', 'আগামীকাল']):
+        if any(kw in msg for kw in ['class', 'ক্লাস']):
+            return 'tomorrow_class'
+    if any(kw in msg for kw in ['today', 'আজ', 'আজকে']):
+        if any(kw in msg for kw in ['class', 'ক্লাস']):
+            return 'today_class'
+    if any(kw in msg for kw in ['next', 'পরবর্তী', 'নেক্সট']):
+        if any(kw in msg for kw in ['class', 'ক্লাস']):
+            return 'next_class'
+    if any(kw in msg for kw in ['cgpa', 'সিজিপিএ', 'জিপিএ']):
+        return 'cgpa'
+    if any(kw in msg for kw in ['result', 'রেজাল্ট', 'ফলাফল']):
+        return 'results'
+    return 'unknown'
+
+
+def assistant_reply(user_id: int, message: str) -> str:
+    qtype = detect_query_type(message)
+    conn = get_db()
+    reply = ""
+
+    if qtype == 'tomorrow_class':
+        tomorrow = (date.today() + timedelta(days=1)).strftime('%A')
+        rows = conn.execute("""
+            SELECT r.start_time, r.room, c.code, c.name
+            FROM routines r JOIN courses c ON r.course_id = c.id
+            JOIN enrollments e ON e.course_id = c.id
+            WHERE e.student_id=? AND r.day_of_week=?
+            ORDER BY r.start_time
+        """, (user_id, tomorrow)).fetchall()
+        if rows:
+            items = [f"{r['code']} ({r['name']}) at {r['start_time']} in Room {r['room']}" for r in rows]
+            reply = f"Tomorrow ({tomorrow}) you have: {'; '.join(items)}"
+        else:
+            reply = f"No classes scheduled for tomorrow ({tomorrow}). 🎉"
+
+    elif qtype == 'today_class':
+        today = date.today().strftime('%A')
+        rows = conn.execute("""
+            SELECT r.start_time, r.room, c.code, c.name
+            FROM routines r JOIN courses c ON r.course_id = c.id
+            JOIN enrollments e ON e.course_id = c.id
+            WHERE e.student_id=? AND r.day_of_week=?
+            ORDER BY r.start_time
+        """, (user_id, today)).fetchall()
+        if rows:
+            items = [f"{r['code']} at {r['start_time']} in Room {r['room']}" for r in rows]
+            reply = f"Today's classes: {'; '.join(items)}"
+        else:
+            reply = "No classes today. Enjoy! 🎉"
+
+    elif qtype == 'next_class':
+        today = date.today().strftime('%A')
+        now = datetime.now().strftime('%H:%M')
+        row = conn.execute("""
+            SELECT r.start_time, r.room, c.code
+            FROM routines r JOIN courses c ON r.course_id = c.id
+            JOIN enrollments e ON e.course_id = c.id
+            WHERE e.student_id=? AND r.day_of_week=? AND r.start_time > ?
+            ORDER BY r.start_time LIMIT 1
+        """, (user_id, today, now)).fetchone()
+        if row:
+            reply = f"Next class: {row['code']} at {row['start_time']} in Room {row['room']}"
+        else:
+            reply = "No more classes today. You're free! 🎉"
+
+    elif qtype == 'attendance_stats':
+        enrollments = conn.execute("SELECT course_id FROM enrollments WHERE student_id=?", (user_id,)).fetchall()
+        if not enrollments:
+            reply = "You are not enrolled in any courses yet."
+        else:
+            details = []
+            total_present, total_sessions = 0, 0
+            for enr in enrollments:
+                cid = enr['course_id']
+                ts = conn.execute("SELECT COUNT(*) as c FROM attendance_sessions WHERE course_id=?", (cid,)).fetchone()['c']
+                pc = conn.execute("""
+                    SELECT COUNT(*) as c FROM attendance_records ar
+                    JOIN attendance_sessions s ON ar.session_id = s.id
+                    WHERE ar.student_id=? AND s.course_id=? AND ar.status='present'
+                """, (user_id, cid)).fetchone()['c']
+                total_present += pc
+                total_sessions += ts
+                course = conn.execute("SELECT code FROM courses WHERE id=?", (cid,)).fetchone()
+                pct = round(pc / ts * 100, 1) if ts > 0 else 0
+                details.append(f"{course['code']}: {pct}%")
+            overall = round(total_present / total_sessions * 100, 1) if total_sessions > 0 else 0
+            reply = f"Your overall attendance is {overall}%. Breakdown: {'; '.join(details)}"
+
+    elif qtype == 'course_teacher':
+        match = re.search(r'([a-z]{2,4}-\d{3})', message.lower())
+        if match:
+            code = match.group(1).upper()
+            row = conn.execute("""
+                SELECT c.code, c.name, u.name as teacher_name
+                FROM courses c LEFT JOIN users u ON c.teacher_id = u.id
+                WHERE UPPER(c.code) LIKE ?
+            """, (f'%{code}%',)).fetchone()
+            if row:
+                reply = f"{row['code']} ({row['name']}) is taught by {row['teacher_name'] or 'TBA'}."
+            else:
+                reply = f"Course {code} not found."
+        else:
+            reply = "Please specify a course code like CSE-301."
+
+    elif qtype == 'cgpa':
+        rows = conn.execute("SELECT grade_point FROM results WHERE student_id=?", (user_id,)).fetchall()
+        if not rows:
+            reply = "No results available yet to calculate CGPA."
+        else:
+            total_gp = sum(r['grade_point'] or 0 for r in rows)
+            cgpa = round(total_gp / len(rows), 2)
+            reply = f"Your current CGPA is {cgpa} based on {len(rows)} results."
+
+    elif qtype == 'results':
+        rows = conn.execute("""
+            SELECT c.code, r.grade, r.marks_obtained, r.total_marks
+            FROM results r JOIN courses c ON r.course_id = c.id
+            WHERE r.student_id=? ORDER BY r.created_at DESC LIMIT 5
+        """, (user_id,)).fetchall()
+        if rows:
+            items = [f"{r['code']}: {r['grade']} ({r['marks_obtained']}/{r['total_marks']})" for r in rows]
+            reply = f"Your recent results: {'; '.join(items)}"
+        else:
+            reply = "No results published yet."
+
+    else:
+        reply = ("I can help with:\n"
+                 "• 'amar kal ki class?' — Tomorrow's classes\n"
+                 "• 'amar attendance koto?' — Attendance stats\n"
+                 "• 'CSE-301 er teacher ke?' — Course teacher\n"
+                 "• 'amar cgpa koto?' — Your CGPA\n"
+                 "• 'amar result dekhao' — Recent results\n\n"
+                 "Try asking in Bangla or English! 😊")
+
+    conn.close()
+    return reply
+
+
+# ─────────────────────────────────────────────
+# HTML Templates
+# ─────────────────────────────────────────────
+def layout(title: str, body: str, user: dict | None = None) -> str:
+    nav_links = ""
+    if user:
+        role = user['role']
+        nav_links = f"""
+        <a href="/dashboard">Dashboard</a>
+        <a href="/courses">Courses</a>
+        <a href="/routine">Routine</a>
+        <a href="/attendance">Attendance</a>
+        <a href="/results">Results</a>
+        <a href="/assistant">Assistant</a>
+        <a href="/notifications">Notifications</a>
+        """
+        if role in ('teacher', 'admin'):
+            nav_links += '<a href="/teacher">Teacher Panel</a>'
+
+    notif_badge = ""
+    if user:
+        conn = get_db()
+        unread = conn.execute("SELECT COUNT(*) as c FROM notifications WHERE user_id=? AND is_read=0", (user['id'],)).fetchone()['c']
+        conn.close()
+        if unread > 0:
+            notif_badge = f'<span class="badge badge-red" id="notifBadge">{unread}</span>'
+
+    user_section = ""
+    if user:
+        user_section = f"""
+        <div class="nav-user">
+            <span>{user['name']}</span>
+            <span class="badge badge-blue">{user['role']}</span>
+            {notif_badge}
+            <a href="/logout" class="btn btn-sm btn-secondary">Logout</a>
+        </div>"""
+    else:
+        user_section = '<div class="nav-user"><a href="/login" class="btn btn-sm btn-primary">Login</a></div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title} — CampusMind</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="nav">
+        <a href="/" class="nav-brand">🎓 CampusMind</a>
+        <div class="nav-links">{nav_links}</div>
+        {user_section}
+    </nav>
+    <div class="container">
+        {body}
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>"""
+
+
+def page_login(error: str = "") -> str:
+    alert = f'<div class="alert alert-error">{error}</div>' if error else ""
+    return layout("Login", f"""
+    <div class="auth-wrap">
+        <div class="auth-card">
+            <h1>Welcome back</h1>
+            <p class="subtitle">Sign in to CampusMind</p>
+            {alert}
+            <form method="POST" action="/login">
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" name="email" required placeholder="you@university.edu">
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" name="password" required placeholder="••••••••">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Sign In</button>
+            </form>
+            <p class="text-sm text-muted mt-16 text-center">Don't have an account? <a href="/register">Register</a></p>
+        </div>
+    </div>""")
+
+
+def page_register(error: str = "") -> str:
+    alert = f'<div class="alert alert-error">{error}</div>' if error else ""
+    return layout("Register", f"""
+    <div class="auth-wrap">
+        <div class="auth-card">
+            <h1>Create account</h1>
+            <p class="subtitle">Join CampusMind</p>
+            {alert}
+            <form method="POST" action="/register">
+                <div class="form-group">
+                    <label>Name</label>
+                    <input type="text" name="name" required placeholder="Full name">
+                </div>
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" name="email" required placeholder="you@university.edu">
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" name="password" required minlength="6" placeholder="Min 6 characters">
+                </div>
+                <div class="form-group">
+                    <label>Role</label>
+                    <select name="role">
+                        <option value="student">Student</option>
+                        <option value="teacher">Teacher</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Student ID (optional)</label>
+                    <input type="text" name="student_id" placeholder="CSE-2021-001">
+                </div>
+                <div class="form-group">
+                    <label>Department (optional)</label>
+                    <input type="text" name="department" placeholder="CSE">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Create Account</button>
+            </form>
+            <p class="text-sm text-muted mt-16 text-center">Already have an account? <a href="/login">Login</a></p>
+        </div>
+    </div>""")
+
+
+def page_dashboard(user: dict) -> str:
+    conn = get_db()
+    uid = user['id']
+    role = user['role']
+
+    stats_html = ""
+    if role == 'student':
+        enrolled = conn.execute("SELECT COUNT(*) as c FROM enrollments WHERE student_id=?", (uid,)).fetchone()['c']
+        today = date.today().strftime('%A')
+        today_classes = conn.execute("""
+            SELECT COUNT(*) as c FROM routines r
+            JOIN enrollments e ON e.course_id = r.course_id
+            WHERE e.student_id=? AND r.day_of_week=?
+        """, (uid, today)).fetchone()['c']
+        unread = conn.execute("SELECT COUNT(*) as c FROM notifications WHERE user_id=? AND is_read=0", (uid,)).fetchone()['c']
+
+        stats_html = f"""
+        <div class="grid grid-4 mb-16">
+            <div class="card stat-card"><div class="stat-value">{enrolled}</div><div class="stat-label">Enrolled Courses</div></div>
+            <div class="card stat-card"><div class="stat-value">{today_classes}</div><div class="stat-label">Classes Today</div></div>
+            <div class="card stat-card"><div class="stat-value">{unread}</div><div class="stat-label">Notifications</div></div>
+        </div>"""
+
+        # Today's schedule
+        rows = conn.execute("""
+            SELECT r.start_time, r.end_time, r.room, c.code, c.name
+            FROM routines r JOIN courses c ON r.course_id = c.id
+            JOIN enrollments e ON e.course_id = c.id
+            WHERE e.student_id=? AND r.day_of_week=?
+            ORDER BY r.start_time
+        """, (uid, today)).fetchall()
+        schedule_items = ""
+        for r in rows:
+            schedule_items += f"<tr><td>{r['start_time']} - {r['end_time']}</td><td>{r['code']}</td><td>{r['name']}</td><td>{r['room']}</td></tr>"
+        schedule_html = f"""
+        <div class="card">
+            <div class="card-title">Today's Schedule ({today})</div>
+            <div class="table-wrap">
+                <table><thead><tr><th>Time</th><th>Code</th><th>Course</th><th>Room</th></tr></thead>
+                <tbody>{schedule_items or '<tr><td colspan="4" class="text-muted text-center">No classes today</td></tr>'}</tbody></table>
+            </div>
+        </div>"""
+        stats_html += schedule_html
+
+    elif role in ('teacher', 'admin'):
+        courses = conn.execute("SELECT COUNT(*) as c FROM courses WHERE teacher_id=?", (uid,)).fetchone()['c']
+        students = conn.execute("SELECT COUNT(*) as c FROM users WHERE role='student'").fetchone()['c']
+        stats_html = f"""
+        <div class="grid grid-3 mb-16">
+            <div class="card stat-card"><div class="stat-value">{courses}</div><div class="stat-label">My Courses</div></div>
+            <div class="card stat-card"><div class="stat-value">{students}</div><div class="stat-label">Total Students</div></div>
+        </div>
+        <div class="card">
+            <div class="card-title">Quick Actions</div>
+            <div class="flex gap-8">
+                <a href="/teacher" class="btn btn-primary">Teacher Panel</a>
+                <a href="/courses" class="btn btn-secondary">Manage Courses</a>
+            </div>
+        </div>"""
+
+    conn.close()
+    return layout("Dashboard", f"""
+    <div class="page-header">
+        <h1>Dashboard</h1>
+        <p>Welcome back, {user['name']}!</p>
+    </div>
+    {stats_html}
+    """, user)
+
+
+def page_courses(user: dict) -> str:
+    conn = get_db()
+    uid = user['id']
+    role = user['role']
+
+    if role == 'student':
+        rows = conn.execute("""
+            SELECT c.id, c.code, c.name, c.credits, c.department, c.semester, u.name as teacher
+            FROM courses c
+            JOIN enrollments e ON e.course_id = c.id
+            LEFT JOIN users u ON c.teacher_id = u.id
+            WHERE e.student_id=?
+        """, (uid,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT c.id, c.code, c.name, c.credits, c.department, c.semester, u.name as teacher
+            FROM courses c LEFT JOIN users u ON c.teacher_id = u.id
+        """).fetchall()
+
+    items = ""
+    for r in rows:
+        items += f"""<tr>
+            <td><strong>{r['code']}</strong></td>
+            <td>{r['name']}</td>
+            <td>{r['credits']}</td>
+            <td>{r['teacher'] or '—'}</td>
+            <td>{r['semester'] or '—'}</td>
+        </tr>"""
+
+    create_form = ""
+    if role in ('teacher', 'admin'):
+        create_form = f"""
+        <div class="card mt-16">
+            <div class="card-title">Add Course</div>
+            <form method="POST" action="/courses/create">
+                <div class="grid grid-3">
+                    <div class="form-group"><label>Code</label><input name="code" required placeholder="CSE-301"></div>
+                    <div class="form-group"><label>Name</label><input name="name" required placeholder="Data Structures"></div>
+                    <div class="form-group"><label>Credits</label><input name="credits" type="number" value="3"></div>
+                </div>
+                <div class="grid grid-2">
+                    <div class="form-group"><label>Department</label><input name="department" placeholder="CSE"></div>
+                    <div class="form-group"><label>Semester</label><input name="semester" placeholder="Fall 2026"></div>
+                </div>
+                <button class="btn btn-primary">Add Course</button>
+            </form>
+        </div>"""
+
+    enroll_form = ""
+    if role == 'student':
+        all_courses = conn.execute("SELECT id, code, name FROM courses").fetchall()
+        opts = ''.join(f'<option value="{c["id"]}">{c["code"]} — {c["name"]}</option>' for c in all_courses)
+        enroll_form = f"""
+        <div class="card mt-16">
+            <div class="card-title">Enroll in Course</div>
+            <form method="POST" action="/courses/enroll">
+                <div class="form-group"><select name="course_id">{opts}</select></div>
+                <button class="btn btn-primary">Enroll</button>
+            </form>
+        </div>"""
+
+    conn.close()
+    return layout("Courses", f"""
+    <div class="page-header"><h1>Courses</h1><p>{'My enrolled courses' if role == 'student' else 'All courses'}</p></div>
+    <div class="card">
+        <div class="table-wrap">
+            <table><thead><tr><th>Code</th><th>Name</th><th>Credits</th><th>Teacher</th><th>Semester</th></tr></thead>
+            <tbody>{items or '<tr><td colspan="5" class="text-muted text-center">No courses found</td></tr>'}</tbody></table>
+        </div>
+    </div>
+    {create_form}
+    {enroll_form}
+    """, user)
+
+
+def page_routine(user: dict) -> str:
+    conn = get_db()
+    uid = user['id']
+    role = user['role']
+
+    if role == 'student':
+        rows = conn.execute("""
+            SELECT r.id, r.day_of_week, r.start_time, r.end_time, r.room, c.code, c.name
+            FROM routines r JOIN courses c ON r.course_id = c.id
+            JOIN enrollments e ON e.course_id = c.id
+            WHERE e.student_id=?
+            ORDER BY CASE r.day_of_week
+                WHEN 'Saturday' THEN 1 WHEN 'Sunday' THEN 2 WHEN 'Monday' THEN 3
+                WHEN 'Tuesday' THEN 4 WHEN 'Wednesday' THEN 5 WHEN 'Thursday' THEN 6 ELSE 7 END,
+                r.start_time
+        """, (uid,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT r.id, r.day_of_week, r.start_time, r.end_time, r.room, c.code, c.name
+            FROM routines r JOIN courses c ON r.course_id = c.id
+            ORDER BY CASE r.day_of_week
+                WHEN 'Saturday' THEN 1 WHEN 'Sunday' THEN 2 WHEN 'Monday' THEN 3
+                WHEN 'Tuesday' THEN 4 WHEN 'Wednesday' THEN 5 WHEN 'Thursday' THEN 6 ELSE 7 END,
+                r.start_time
+        """).fetchall()
+
+    items = ""
+    for r in rows:
+        items += f"<tr><td>{r['day_of_week']}</td><td>{r['start_time']} - {r['end_time']}</td><td>{r['code']}</td><td>{r['name']}</td><td>{r['room']}</td></tr>"
+
+    add_form = ""
+    if role in ('teacher', 'admin'):
+        courses = conn.execute("SELECT id, code, name FROM courses").fetchall()
+        opts = ''.join(f'<option value="{c["id"]}">{c["code"]} — {c["name"]}</option>' for c in courses)
+        days = ''.join(f'<option value="{d}">{d}</option>' for d in DAY_MAP.values())
+        add_form = f"""
+        <div class="card mt-16">
+            <div class="card-title">Add Routine Entry</div>
+            <form method="POST" action="/routine/create">
+                <div class="grid grid-3">
+                    <div class="form-group"><label>Course</label><select name="course_id">{opts}</select></div>
+                    <div class="form-group"><label>Day</label><select name="day_of_week">{days}</select></div>
+                    <div class="form-group"><label>Room</label><input name="room" required placeholder="301"></div>
+                </div>
+                <div class="grid grid-2">
+                    <div class="form-group"><label>Start Time</label><input name="start_time" type="time" required></div>
+                    <div class="form-group"><label>End Time</label><input name="end_time" type="time" required></div>
+                </div>
+                <button class="btn btn-primary">Add to Routine</button>
+            </form>
+        </div>"""
+
+    conn.close()
+    return layout("Routine", f"""
+    <div class="page-header"><h1>Class Routine</h1><p>Weekly schedule</p></div>
+    <div class="card">
+        <div class="table-wrap">
+            <table><thead><tr><th>Day</th><th>Time</th><th>Code</th><th>Course</th><th>Room</th></tr></thead>
+            <tbody>{items or '<tr><td colspan="5" class="text-muted text-center">No routine entries</td></tr>'}</tbody></table>
+        </div>
+    </div>
+    {add_form}
+    """, user)
+
+
+def page_attendance(user: dict) -> str:
+    conn = get_db()
+    uid = user['id']
+    role = user['role']
+    body = ""
+
+    if role == 'student':
+        # Show mark form + history
+        records = conn.execute("""
+            SELECT ar.status, ar.method, ar.marked_at, s.session_date, c.code
+            FROM attendance_records ar
+            JOIN attendance_sessions s ON ar.session_id = s.id
+            JOIN courses c ON s.course_id = c.id
+            WHERE ar.student_id=?
+            ORDER BY ar.marked_at DESC LIMIT 20
+        """, (uid,)).fetchall()
+
+        rows_html = ""
+        for r in records:
+            status_badge = {'present': 'badge-green', 'late': 'badge-yellow', 'absent': 'badge-red'}.get(r['status'], 'badge-blue')
+            rows_html += f"<tr><td>{r['session_date']}</td><td>{r['code']}</td><td><span class='badge {status_badge}'>{r['status']}</span></td><td>{r['method']}</td></tr>"
+
+        body = f"""
+        <div class="card mb-16">
+            <div class="card-title">Mark Attendance</div>
+            <form id="markForm">
+                <div class="grid grid-2">
+                    <div class="form-group"><label>Session ID</label><input id="sessionId" type="number" required placeholder="e.g. 1"></div>
+                    <div class="form-group"><label>QR Code</label><input id="qrCode" required placeholder="Enter code"></div>
+                </div>
+                <button class="btn btn-primary">Mark Attendance</button>
+            </form>
+            <div id="markResult" class="mt-16"></div>
+        </div>
+        <div class="card">
+            <div class="card-title">Attendance History</div>
+            <div class="table-wrap">
+                <table><thead><tr><th>Date</th><th>Course</th><th>Status</th><th>Method</th></tr></thead>
+                <tbody>{rows_html or '<tr><td colspan="4" class="text-muted text-center">No records yet</td></tr>'}</tbody></table>
+            </div>
+        </div>"""
+
+    else:
+        # Teacher: create session + view sessions
+        courses = conn.execute("SELECT id, code, name FROM courses WHERE teacher_id=?", (uid,)).fetchall()
+        opts = ''.join(f'<option value="{c["id"]}">{c["code"]} — {c["name"]}</option>' for c in courses)
+        sessions = conn.execute("""
+            SELECT s.id, s.qr_code, s.session_date, s.is_active, s.expires_at, c.code
+            FROM attendance_sessions s JOIN courses c ON s.course_id = c.id
+            WHERE s.teacher_id=? ORDER BY s.created_at DESC LIMIT 10
+        """, (uid,)).fetchall()
+
+        sess_rows = ""
+        for s in sessions:
+            status = '<span class="badge badge-green">Active</span>' if s['is_active'] else '<span class="badge badge-red">Expired</span>'
+            sess_rows += f"<tr><td>{s['id']}</td><td>{s['code']}</td><td class='font-mono'>{s['qr_code']}</td><td>{s['session_date']}</td><td>{status}</td></tr>"
+
+        body = f"""
+        <div class="card mb-16">
+            <div class="card-title">Start Attendance Session</div>
+            <form id="sessionForm">
+                <div class="grid grid-2">
+                    <div class="form-group"><label>Course</label><select id="sessionCourseId">{opts}</select></div>
+                    <div class="form-group"><label>Duration (minutes)</label><input id="sessionDuration" type="number" value="10" min="1" max="60"></div>
+                </div>
+                <button class="btn btn-primary">Create Session</button>
+            </form>
+            <div id="sessionResult"></div>
+        </div>
+        <div class="card">
+            <div class="card-title">Recent Sessions</div>
+            <div class="table-wrap">
+                <table><thead><tr><th>ID</th><th>Course</th><th>Code</th><th>Date</th><th>Status</th></tr></thead>
+                <tbody>{sess_rows or '<tr><td colspan="5" class="text-muted text-center">No sessions yet</td></tr>'}</tbody></table>
+            </div>
+        </div>"""
+
+    conn.close()
+    return layout("Attendance", f"""
+    <div class="page-header"><h1>Attendance</h1><p>{'Mark your attendance' if role == 'student' else 'Manage attendance sessions'}</p></div>
+    {body}
+    """, user)
+
+
+def page_results(user: dict) -> str:
+    conn = get_db()
+    uid = user['id']
+    role = user['role']
+
+    if role == 'student':
+        rows = conn.execute("""
+            SELECT r.exam_type, r.marks_obtained, r.total_marks, r.grade, r.grade_point, c.code
+            FROM results r JOIN courses c ON r.course_id = c.id
+            WHERE r.student_id=? ORDER BY r.created_at DESC
+        """, (uid,)).fetchall()
+
+        items = ""
+        for r in rows:
+            items += f"<tr><td>{r['code']}</td><td>{r['exam_type']}</td><td>{r['marks_obtained']}/{r['total_marks']}</td><td><strong>{r['grade']}</strong></td><td>{r['grade_point']}</td></tr>"
+
+        # CGPA
+        all_gp = conn.execute("SELECT grade_point FROM results WHERE student_id=? AND grade_point IS NOT NULL", (uid,)).fetchall()
+        cgpa = round(sum(r['grade_point'] for r in all_gp) / len(all_gp), 2) if all_gp else 0
+
+        body = f"""
+        <div class="grid grid-3 mb-16">
+            <div class="card stat-card"><div class="stat-value">{cgpa}</div><div class="stat-label">CGPA</div></div>
+            <div class="card stat-card"><div class="stat-value">{len(all_gp)}</div><div class="stat-label">Total Results</div></div>
+        </div>
+        <div class="card">
+            <div class="card-title">My Results</div>
+            <div class="table-wrap">
+                <table><thead><tr><th>Course</th><th>Exam</th><th>Marks</th><th>Grade</th><th>GP</th></tr></thead>
+                <tbody>{items or '<tr><td colspan="5" class="text-muted text-center">No results yet</td></tr>'}</tbody></table>
+            </div>
+        </div>"""
+    else:
+        body = """<div class="card"><p>Use the <a href="/teacher">Teacher Panel</a> to enter results.</p></div>"""
+
+    conn.close()
+    return layout("Results", f"""
+    <div class="page-header"><h1>Results</h1></div>
+    {body}
+    """, user)
+
+
+def page_teacher(user: dict) -> str:
+    conn = get_db()
+    uid = user['id']
+
+    courses = conn.execute("SELECT id, code, name FROM courses WHERE teacher_id=?", (uid,)).fetchall()
+    students = conn.execute("SELECT id, name, student_id FROM users WHERE role='student'").fetchall()
+
+    course_opts = ''.join(f'<option value="{c["id"]}">{c["code"]} — {c["name"]}</option>' for c in courses)
+    student_opts = ''.join(f'<option value="{s["id"]}">{s["name"]} ({s["student_id"] or s["id"]})</option>' for s in students)
+
+    conn.close()
+    return layout("Teacher Panel", f"""
+    <div class="page-header"><h1>Teacher Panel</h1><p>Manage results and syllabus</p></div>
+    <div class="grid grid-2">
+        <div class="card">
+            <div class="card-title">Enter Result</div>
+            <form method="POST" action="/teacher/result">
+                <div class="form-group"><label>Student</label><select name="student_id">{student_opts}</select></div>
+                <div class="form-group"><label>Course</label><select name="course_id">{course_opts}</select></div>
+                <div class="grid grid-2">
+                    <div class="form-group"><label>Exam Type</label>
+                        <select name="exam_type">
+                            <option value="mid">Mid</option>
+                            <option value="final">Final</option>
+                            <option value="quiz">Quiz</option>
+                            <option value="assignment">Assignment</option>
+                        </select>
+                    </div>
+                    <div class="form-group"><label>Marks</label><input name="marks" type="number" step="0.5" required></div>
+                </div>
+                <div class="form-group"><label>Total Marks</label><input name="total" type="number" value="100"></div>
+                <button class="btn btn-primary">Submit Result</button>
+            </form>
+        </div>
+        <div class="card">
+            <div class="card-title">Add Syllabus Topic</div>
+            <form method="POST" action="/teacher/syllabus">
+                <div class="form-group"><label>Course</label><select name="course_id">{course_opts}</select></div>
+                <div class="form-group"><label>Topic Title</label><input name="title" required placeholder="Chapter 1: Introduction"></div>
+                <div class="form-group"><label>Week Number</label><input name="week_number" type="number" placeholder="1"></div>
+                <button class="btn btn-primary">Add Topic</button>
+            </form>
+        </div>
+    </div>
+    """, user)
+
+
+def page_notifications(user: dict) -> str:
+    conn = get_db()
+    rows = conn.execute("SELECT id, title, message, is_read, created_at FROM notifications WHERE user_id=? ORDER BY created_at DESC", (user['id'],)).fetchall()
+    conn.close()
+
+    items = ""
+    for r in rows:
+        read_class = "" if r['is_read'] else "style='border-left: 3px solid var(--primary);'"
+        btn = "" if r['is_read'] else f'<button class="btn btn-sm btn-secondary" data-notif-id="{r["id"]}">Mark Read</button>'
+        items += f"""<div class="card" {read_class}>
+            <div class="flex-between">
+                <div><strong>{r['title']}</strong><p class="text-sm text-muted">{r['message']}</p></div>
+                {btn}
+            </div>
+        </div>"""
+
+    return layout("Notifications", f"""
+    <div class="page-header"><h1>Notifications</h1></div>
+    {items or '<div class="empty-state"><div class="icon">🔔</div><p>No notifications</p></div>'}
+    """, user)
+
+
+def page_assistant(user: dict) -> str:
+    return layout("Assistant", f"""
+    <div class="page-header"><h1>AI Assistant</h1><p>Ask in Bangla or English</p></div>
+    <div class="card">
+        <div class="chat-container">
+            <div class="chat-messages" id="chatMessages">
+                <div class="chat-msg bot">Hello! I can help with your academic queries. Try asking:<br>
+                • "amar kal ki class?"<br>• "amar attendance koto?"<br>• "CSE-301 er teacher ke?"<br>• "amar cgpa koto?"</div>
+            </div>
+            <div class="chat-input-row">
+                <input id="chatInput" placeholder="Ask me anything..." autocomplete="off">
+                <button id="chatSend" class="btn btn-primary">Send</button>
+            </div>
+        </div>
+    </div>
+    """, user)
+
+
+# ─────────────────────────────────────────────
+# HTTP Handler
+# ─────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+
+    def send_html(self, html: str, status: int = 200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    def send_json(self, data: dict, status: int = 200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def send_redirect(self, path: str):
+        self.send_response(302)
+        self.send_header('Location', path)
+        self.end_headers()
+
+    def read_body(self) -> dict:
+        length = int(self.headers.get('Content-Length', 0))
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length).decode()
+        ct = self.headers.get('Content-Type', '')
+        if 'application/json' in ct:
+            return json.loads(raw)
+        return {k: v[0] for k, v in parse_qs(raw).items()}
+
+    def get_user(self) -> dict | None:
+        return get_current_user(self)
+
+    def require_auth(self) -> dict | None:
+        user = self.get_user()
+        if not user:
+            self.send_redirect('/login')
+            return None
+        return user
+
+    # ── Routing ──
+    def do_GET(self):
+        path = urlparse(self.path).path
+
+        # Static files
+        if path.startswith('/static/'):
+            self.serve_static(path)
+            return
+
+        # Public pages
+        if path == '/login':
+            self.send_html(page_login())
+            return
+        if path == '/register':
+            self.send_html(page_register())
+            return
+        if path == '/logout':
+            self.send_response(302)
+            self.send_header('Set-Cookie', f'{SESSION_NAME}=; Max-Age=0; Path=/')
+            self.send_header('Location', '/login')
+            self.end_headers()
+            return
+
+        # Protected pages
+        user = self.require_auth()
+        if not user:
+            return
+
+        routes = {
+            '/': '/dashboard',
+            '/dashboard': lambda: page_dashboard(user),
+            '/courses': lambda: page_courses(user),
+            '/routine': lambda: page_routine(user),
+            '/attendance': lambda: page_attendance(user),
+            '/results': lambda: page_results(user),
+            '/notifications': lambda: page_notifications(user),
+            '/assistant': lambda: page_assistant(user),
+            '/teacher': lambda: page_teacher(user) if user['role'] in ('teacher', 'admin') else page_dashboard(user),
+        }
+
+        if path in routes:
+            handler = routes[path]
+            if callable(handler):
+                self.send_html(handler())
+            else:
+                self.send_redirect(handler)
+            return
+
+        self.send_html(layout("404", "<div class='empty-state'><div class='icon'>404</div><p>Page not found</p></div>", user), 404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        body = self.read_body()
+
+        # ── API Routes ──
+        if path.startswith('/api/'):
+            self.handle_api(path, body)
+            return
+
+        # ── Form POST Routes ──
+        if path == '/login':
+            self.handle_login(body)
+        elif path == '/register':
+            self.handle_register(body)
+        elif path == '/courses/create':
+            self.handle_course_create(body)
+        elif path == '/courses/enroll':
+            self.handle_enroll(body)
+        elif path == '/routine/create':
+            self.handle_routine_create(body)
+        elif path == '/teacher/result':
+            self.handle_result_submit(body)
+        elif path == '/teacher/syllabus':
+            self.handle_syllabus_create(body)
+        else:
+            self.send_redirect('/')
+
+    # ── Auth Handlers ──
+    def handle_login(self, body: dict):
+        email = body.get('email', '').strip()
+        password = body.get('password', '')
+        conn = get_db()
+        row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        conn.close()
+
+        if not row or not verify_password(password, row['password_hash']):
+            self.send_html(page_login("Invalid email or password"), 401)
+            return
+
+        token = create_session_token(row['id'])
+        self.send_response(302)
+        self.send_header('Set-Cookie', f'{SESSION_NAME}={token}; Path=/; HttpOnly; Max-Age={SESSION_MAX_AGE}')
+        self.send_header('Location', '/dashboard')
+        self.end_headers()
+
+    def handle_register(self, body: dict):
+        name = body.get('name', '').strip()
+        email = body.get('email', '').strip()
+        password = body.get('password', '')
+        role = body.get('role', 'student')
+        student_id = body.get('student_id', '')
+        department = body.get('department', '')
+
+        if not name or not email or not password:
+            self.send_html(page_register("All fields required"), 400)
+            return
+        if len(password) < 6:
+            self.send_html(page_register("Password must be at least 6 characters"), 400)
+            return
+
+        conn = get_db()
+        existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        if existing:
+            conn.close()
+            self.send_html(page_register("Email already registered"), 400)
+            return
+
+        conn.execute("INSERT INTO users (name, email, password_hash, role, student_id, department) VALUES (?,?,?,?,?,?)",
+                     (name, email, hash_password(password), role, student_id, department))
+        conn.commit()
+        uid = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()['id']
+        conn.close()
+
+        token = create_session_token(uid)
+        self.send_response(302)
+        self.send_header('Set-Cookie', f'{SESSION_NAME}={token}; Path=/; HttpOnly; Max-Age={SESSION_MAX_AGE}')
+        self.send_header('Location', '/dashboard')
+        self.end_headers()
+
+    # ── Course Handlers ──
+    def handle_course_create(self, body: dict):
+        user = self.get_user()
+        if not user or user['role'] not in ('teacher', 'admin'):
+            self.send_redirect('/login')
+            return
+        conn = get_db()
+        try:
+            conn.execute("INSERT INTO courses (code, name, credits, department, semester, teacher_id) VALUES (?,?,?,?,?,?)",
+                         (body.get('code'), body.get('name'), int(body.get('credits', 3)),
+                          body.get('department'), body.get('semester'), user['id']))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+        conn.close()
+        self.send_redirect('/courses')
+
+    def handle_enroll(self, body: dict):
+        user = self.get_user()
+        if not user:
+            self.send_redirect('/login')
+            return
+        conn = get_db()
+        try:
+            conn.execute("INSERT INTO enrollments (student_id, course_id) VALUES (?,?)",
+                         (user['id'], int(body.get('course_id', 0))))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+        conn.close()
+        self.send_redirect('/courses')
+
+    # ── Routine Handler ──
+    def handle_routine_create(self, body: dict):
+        user = self.get_user()
+        if not user or user['role'] not in ('teacher', 'admin'):
+            self.send_redirect('/login')
+            return
+        conn = get_db()
+        conn.execute("INSERT INTO routines (course_id, day_of_week, start_time, end_time, room) VALUES (?,?,?,?,?)",
+                     (int(body.get('course_id', 0)), body.get('day_of_week'),
+                      body.get('start_time'), body.get('end_time'), body.get('room')))
+        conn.commit()
+        conn.close()
+        self.send_redirect('/routine')
+
+    # ── Result Handler ──
+    def handle_result_submit(self, body: dict):
+        user = self.get_user()
+        if not user or user['role'] not in ('teacher', 'admin'):
+            self.send_redirect('/login')
+            return
+        marks = float(body.get('marks', 0))
+        total = float(body.get('total', 100))
+        grade, gp = calc_grade(marks, total)
+        conn = get_db()
+        conn.execute("INSERT INTO results (student_id, course_id, exam_type, marks_obtained, total_marks, grade, grade_point) VALUES (?,?,?,?,?,?,?)",
+                     (int(body.get('student_id', 0)), int(body.get('course_id', 0)),
+                      body.get('exam_type'), marks, total, grade, gp))
+        conn.commit()
+        conn.close()
+        self.send_redirect('/teacher')
+
+    # ── Syllabus Handler ──
+    def handle_syllabus_create(self, body: dict):
+        user = self.get_user()
+        if not user or user['role'] not in ('teacher', 'admin'):
+            self.send_redirect('/login')
+            return
+        conn = get_db()
+        conn.execute("INSERT INTO syllabus_topics (course_id, title, week_number) VALUES (?,?,?)",
+                     (int(body.get('course_id', 0)), body.get('title'), int(body.get('week_number', 0)) or None))
+        conn.commit()
+        conn.close()
+        self.send_redirect('/teacher')
+
+    # ── API Handlers ──
+    def handle_api(self, path: str, body: dict):
+        user = self.get_user()
+        if not user:
+            self.send_json({"error": "Unauthorized"}, 401)
+            return
+
+        if path == '/api/assistant/chat':
+            reply = assistant_reply(user['id'], body.get('message', ''))
+            self.send_json({"reply": reply})
+
+        elif path == '/api/attendance/mark':
+            self.api_mark_attendance(user, body)
+
+        elif path == '/api/attendance/session':
+            self.api_create_session(user, body)
+
+        elif path.startswith('/api/notifications/') and path.endswith('/read'):
+            nid = path.split('/')[3]
+            conn = get_db()
+            conn.execute("UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?", (nid, user['id']))
+            conn.commit()
+            conn.close()
+            self.send_json({"ok": True})
+
+        elif path.startswith('/api/syllabus/') and path.endswith('/toggle'):
+            tid = path.split('/')[3]
+            conn = get_db()
+            conn.execute("UPDATE syllabus_topics SET is_completed = 1 - is_completed WHERE id=?", (tid,))
+            conn.commit()
+            conn.close()
+            self.send_json({"ok": True})
+
+        else:
+            self.send_json({"error": "Not found"}, 404)
+
+    def api_mark_attendance(self, user: dict, body: dict):
+        session_id = body.get('session_id')
+        qr_code = body.get('qr_code', '')
+        conn = get_db()
+
+        session = conn.execute("SELECT * FROM attendance_sessions WHERE id=? AND is_active=1", (session_id,)).fetchone()
+        if not session:
+            conn.close()
+            self.send_json({"error": "Invalid or expired session"}, 400)
+            return
+        if session['qr_code'] != qr_code:
+            conn.close()
+            self.send_json({"error": "Invalid QR code"}, 400)
+            return
+        if datetime.now() > datetime.fromisoformat(session['expires_at']):
+            conn.close()
+            self.send_json({"error": "Session expired"}, 400)
+            return
+
+        enrolled = conn.execute("SELECT id FROM enrollments WHERE student_id=? AND course_id=?",
+                                (user['id'], session['course_id'])).fetchone()
+        if not enrolled:
+            conn.close()
+            self.send_json({"error": "Not enrolled in this course"}, 403)
+            return
+
+        dup = conn.execute("SELECT id FROM attendance_records WHERE session_id=? AND student_id=?",
+                           (session_id, user['id'])).fetchone()
+        if dup:
+            conn.close()
+            self.send_json({"error": "Already marked"}, 400)
+            return
+
+        conn.execute("INSERT INTO attendance_records (session_id, student_id, method, status) VALUES (?,?,?,?)",
+                     (session_id, user['id'], 'qr', 'present'))
+        conn.commit()
+        conn.close()
+        self.send_json({"ok": True, "status": "present"})
+
+    def api_create_session(self, user: dict, body: dict):
+        if user['role'] not in ('teacher', 'admin'):
+            self.send_json({"error": "Teachers only"}, 403)
+            return
+        course_id = body.get('course_id')
+        duration = int(body.get('duration_minutes', 10))
+        conn = get_db()
+
+        course = conn.execute("SELECT id FROM courses WHERE id=? AND teacher_id=?", (course_id, user['id'])).fetchone()
+        if not course:
+            conn.close()
+            self.send_json({"error": "You don't teach this course"}, 403)
+            return
+
+        qr_code = secrets.token_hex(6)
+        expires = (datetime.now() + timedelta(minutes=duration)).isoformat()
+        conn.execute("INSERT INTO attendance_sessions (course_id, teacher_id, qr_code, expires_at) VALUES (?,?,?,?)",
+                     (course_id, user['id'], qr_code, expires))
+        conn.commit()
+        sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        self.send_json({"id": sid, "qr_code": qr_code, "expires_at": expires})
+
+    # ── Static Files ──
+    def serve_static(self, path: str):
+        file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path.lstrip('/'))
+        if not os.path.isfile(file_path):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        ext = os.path.splitext(file_path)[1]
+        content_type = {'.css': 'text/css', '.js': 'application/javascript', '.png': 'image/png', '.ico': 'image/x-icon'}.get(ext, 'application/octet-stream')
+
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', len(data))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    init_db()
+    server = HTTPServer(('0.0.0.0', PORT), Handler)
+    print(f"🎓 CampusMind running at http://localhost:{PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.shutdown()
