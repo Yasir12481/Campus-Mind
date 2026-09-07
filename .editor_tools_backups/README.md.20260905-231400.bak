@@ -1,0 +1,65 @@
+# 🎓 CampusMind — Smart Campus Management System
+
+Minimal campus management platform. **Zero dependencies.** Pure Python stdlib + SQLite + HTML/CSS/JS.
+
+## Quick Start
+
+```bash
+./start.sh
+# or
+python app.py
+```
+
+Open http://localhost:8000
+
+## Features
+
+- **Auth** — Register/Login with session cookies, PBKDF2 password hashing
+- **Roles** — Student, Teacher, Admin
+- **Courses** — Create, enroll, manage
+- **Routine** — Weekly class schedule
+- **Attendance** — QR/code-based sessions, bunk calculator, stats
+- **Results** — Marks entry, auto grade calculation, CGPA
+- **Syllabus** — Topic tracker with completion status
+- **Notifications** — Per-user notification system
+- **AI Assistant** — Rule-based Bangla/English query bot
+
+## Assistant Queries
+
+| Query | Response |
+|-------|----------|
+| `amar kal ki class?` | Tomorrow's classes |
+| `amar attendance koto?` | Attendance stats |
+| `CSE-301 er teacher ke?` | Course teacher |
+| `amar cgpa koto?` | CGPA calculation |
+| `amar result dekhao` | Recent results |
+
+Works in both Bangla and English.
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Backend | Python stdlib (`http.server`, `sqlite3`, `hashlib`, `hmac`) |
+| Frontend | Plain HTML + CSS + vanilla JS |
+| Database | SQLite |
+| Auth | PBKDF2 + signed session cookies |
+
+**No frameworks. No npm. No pip install. Just Python.**
+
+## Structure
+
+```
+Campus-Mind/
+├── app.py           # Server + routing + all logic
+├── static/
+│   ├── style.css    # All styles
+│   └── app.js       # Client-side JS
+├── campusmind.db    # SQLite database (auto-created)
+├── start.sh
+└── README.md
+```
+
+## License
+
+MIT
